@@ -1,0 +1,97 @@
+#!/bin/bash
+# Easy Effects headless on a private Xvfb display.
+# Runs as the unit's main process and owns start/stop order:
+# Xvfb up -> Easy Effects up -> preset loaded ... SIGTERM -> Easy Effects down -> Xvfb down.
+
+set -u
+
+PRESET="Main"
+DISPLAY_NUM=43
+
+runtime="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR not set}"
+xvfb_pid=
+ee_pid=
+
+# Identical, minimal environment in Desktop and Game Mode. Nothing the session
+# exports (DISPLAY, QT_QPA_PLATFORM, WAYLAND_DISPLAY, gamescope vars...) gets in.
+clean_env=()
+for v in HOME USER LOGNAME PATH LANG LANGUAGE $(compgen -e LC_) \
+         XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS XDG_CONFIG_HOME XDG_DATA_HOME \
+         XDG_STATE_HOME XDG_CACHE_HOME XDG_DATA_DIRS XDG_CONFIG_DIRS; do
+    [[ -n ${!v-} ]] && clean_env+=("$v=${!v}")
+done
+
+alive() { [[ $(ps -o stat= -p "$1" 2>/dev/null) == [^Z]* ]]; }
+
+stop_pid() { # pid, timeout in seconds
+    [[ -n $1 ]] || return 0
+    kill -TERM "$1" 2>/dev/null || return 0
+    for ((i = 0; i < $2 * 10; i++)); do alive "$1" || break; sleep 0.1; done
+    kill -KILL "$1" 2>/dev/null
+    wait "$1" 2>/dev/null
+}
+
+stop_all() {
+    trap - TERM INT
+    # Easy Effects quits and saves on SIGTERM. Its display must outlive it,
+    # otherwise Qt's X11 teardown hangs until systemd SIGKILLs it.
+    stop_pid "$ee_pid" 8
+    stop_pid "$xvfb_pid" 3
+}
+
+# Client calls (-l, -b, -q) construct a full QApplication too, so they need a
+# Qt platform. offscreen needs no display at all.
+ee_cmd() { timeout 10 env -i "${clean_env[@]}" QT_QPA_PLATFORM=offscreen easyeffects "$@"; }
+
+trap 'stop_all; exit 0' TERM INT
+
+# Single-instance lock: if another Easy Effects is still running (e.g. left over
+# from Desktop Mode), a new one only forwards its arguments and exits.
+lock="$runtime/easyeffects.lock"
+if [[ -r $lock ]] && read -r old_pid < "$lock" && [[ $old_pid =~ ^[0-9]+$ ]] \
+   && [[ $(cat "/proc/$old_pid/comm" 2>/dev/null) == easyeffects ]]; then
+    echo "Stopping already running Easy Effects (pid $old_pid)" >&2
+    kill -TERM "$old_pid"
+    for _ in {1..80}; do [[ -e /proc/$old_pid ]] || break; sleep 0.1; done
+fi
+rm -f "$runtime/EasyEffectsServer"
+
+# -displayfd: Xvfb writes the display number once it accepts connections.
+coproc XVFB { exec env -i "${clean_env[@]}" /usr/bin/Xvfb ":$DISPLAY_NUM" -displayfd 1 -screen 0 640x480x24 -nolisten tcp; }
+xvfb_pid=$XVFB_PID
+if ! read -r -t 10 -u "${XVFB[0]}" display; then
+    echo "Xvfb failed to start" >&2
+    stop_all
+    exit 1
+fi
+
+env -i "${clean_env[@]}" DISPLAY=":$display" QT_QPA_PLATFORM=xcb \
+    easyeffects --service-mode --hide-window &
+ee_pid=$!
+
+for _ in {1..150}; do
+    [[ -S $runtime/EasyEffectsServer ]] && break
+    alive "$ee_pid" || break
+    sleep 0.1
+done
+
+if [[ -S $runtime/EasyEffectsServer ]]; then
+    ee_cmd -l "$PRESET"
+    ee_cmd -b 2
+else
+    echo "Easy Effects control socket never appeared; preset not loaded" >&2
+fi
+
+# Block until either process dies on its own; systemd's SIGTERM goes to the trap.
+wait -n -p ended "$ee_pid" "$xvfb_pid"
+rc=$?
+if [[ ${ended:-} == "$ee_pid" ]]; then
+    echo "Easy Effects exited (status $rc)" >&2
+    ee_pid=
+else
+    echo "Xvfb exited (status $rc)" >&2
+    xvfb_pid=
+    rc=1
+fi
+stop_all
+exit "$rc"

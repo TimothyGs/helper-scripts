@@ -1,0 +1,16 @@
+[Unit]
+Description=Easy Effects (Game Mode)
+After=gamescope-session.service pipewire.service wireplumber.service
+PartOf=gamescope-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/easyeffects-xvfb
+# SIGTERM goes to the script only; it stops Easy Effects before Xvfb.
+KillMode=mixed
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=gamescope-session.target
